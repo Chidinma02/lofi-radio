@@ -140,6 +140,7 @@ export default function App() {
   });
   const audioRef = useRef(null);
   const debounceRef = useRef(null);
+  const playTimeoutRef = useRef(null);
   const titleRef = useRef(null);
   const [titleLong, setTitleLong] = useState(false);
 
@@ -302,11 +303,27 @@ export default function App() {
   // Background liveness check: the directory lists every known stream, but
   // plenty of hosts are dead. Browsers won't expose cross-origin HEAD
   // statuses, so we use no-cors requests — ANY response (even opaque)
-  // proves the host is still up.
+  // proves the host is still up. Kept small + paused while audio is
+  // playing/buffering so probes never steal bandwidth from the stream
+  // you're actually listening to. On mobile / slow connections we probe
+  // even less — every byte counts there.
   const poolSig = useMemo(() => pool.map(stationKey).join('|'), [pool]);
+  const slowLink = useMemo(() => {
+    try {
+      const c = navigator.connection;
+      if (c?.saveData) return true;
+      if (typeof c?.effectiveType === 'string') {
+        return /^(slow-2g|2g|3g)$/.test(c.effectiveType);
+      }
+    } catch {
+      /* NetworkInformation unsupported — assume a fast link */
+    }
+    return false;
+  }, []);
   useEffect(() => {
+    if (playing || buffering) return undefined;
     let cancelled = false;
-    const targets = pool.slice(0, 200);
+    const targets = pool.slice(0, slowLink ? 20 : 60);
     setLiveKeys(new Set());
     setCheckedKeys(new Set());
     if (targets.length === 0) {
@@ -344,13 +361,13 @@ export default function App() {
         await probeOne(s);
       }
     };
-    const lanes = Math.min(6, targets.length);
+    const lanes = Math.min(slowLink ? 2 : 6, targets.length);
     for (let i = 0; i < lanes; i += 1) worker();
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [poolSig]);
+  }, [poolSig, playing, buffering]);
   const modeInfo = MODES.find((m) => m.id === mode);
 
   function saveLast(patch) {
@@ -362,6 +379,40 @@ export default function App() {
     }
   }
 
+  // Pre-warm connections to the fastest hosts in the current list so
+  // the next tap (or auto-skip) starts almost instantly. Lightweight
+  // streams (<128kbps) pre-connect first — they're the quickest to
+  // start, especially on mobile.
+  useEffect(() => {
+    if (list.length === 0) return undefined;
+    const timer = setTimeout(() => {
+      try {
+        const prioritized = [...list].sort((a, b) => (a.bitrate || 999) - (b.bitrate || 999));
+        const hosts = new Set();
+        for (const s of prioritized.slice(0, 8)) {
+          try {
+            hosts.add(new URL(s.url_resolved).origin);
+          } catch {
+            /* skip bad URLs */
+          }
+          if (hosts.size >= 4) break;
+        }
+        for (const host of hosts) {
+          if (document.querySelector(`link[rel="preconnect"][href="${host}"]`)) continue;
+          const link = document.createElement('link');
+          link.rel = 'preconnect';
+          link.href = host;
+          document.head.appendChild(link);
+          setTimeout(() => link.remove(), 60000);
+        }
+      } catch {
+        /* preconnect is best-effort */
+      }
+    }, 1500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poolSig]);
+
   function play(
     station,
     { silentOnAutoplayBlock = false, markResumed = false } = {},
@@ -371,7 +422,41 @@ export default function App() {
     setError('');
     setCurrent(station);
     setBuffering(true);
+    // Warm up the connection (DNS + TLS) before play() so audio
+    // starts faster, then give up + auto-skip if the host stalls.
+    try {
+      const host = new URL(station.url_resolved).origin;
+      const link = document.createElement('link');
+      link.rel = 'preconnect';
+      link.href = host;
+      document.head.appendChild(link);
+      setTimeout(() => link.remove(), 15000);
+    } catch {
+      /* invalid URL — play() will fail and show the error toast */
+    }
+    clearTimeout(playTimeoutRef.current);
+    // Slow links get more patience (15s) but skip to the lightest
+    // stream available — a 48–64kbps station starts far faster on 3G
+    // than a 320kbps one, and still sounds fine on phone speakers.
+    const skipTimeout = slowLink ? 15000 : 8000;
+    playTimeoutRef.current = setTimeout(() => {
+      // Still buffering → this host is slow, skip to the fastest-starting
+      // alternative instead of just the next row.
+      setBuffering((b) => {
+        if (b) {
+          audio.pause();
+          const next = pickFastStart(list, station);
+          if (next && stationKey(next) !== stationKey(station)) play(next);
+          else {
+            setBuffering(false);
+            setError(`“${station.name}” is taking too long. Try another station.`);
+          }
+        }
+        return b;
+      });
+    }, skipTimeout);
     audio.src = station.url_resolved;
+    audio.load();
     audio.play().then(
       () => {
         if (markResumed) setAwaitingResume(false);
@@ -420,7 +505,7 @@ export default function App() {
     if (stations.length === 0) return;
     if (!current || !stations.some((s) => stationKey(s) === stationKey(current))) {
       if (awaitingResume) setAwaitingResume(false);
-      play(stations[0]);
+      play(pickFastStart(stations, current));
     }
   }
 
@@ -434,7 +519,28 @@ export default function App() {
     const stations = modePool.filter((s) => (shortCountry(s.country) || 'Other') === next);
     if (stations.length === 0) return;
     if (awaitingResume) setAwaitingResume(false);
-    play(stations[0]);
+    play(pickFastStart(stations, current));
+  }
+
+  // Pick the station likely to start fastest: prefer verified-live hosts,
+  // then lighter bitrates (less data before first audio). Keeps the
+  // current station out of the running unless it's the only option.
+  function pickFastStart(stations, exclude) {
+    if (stations.length === 0) return stations[0];
+    const candidates = exclude
+      ? stations.filter((s) => stationKey(s) !== stationKey(exclude))
+      : stations;
+    const pool = candidates.length > 0 ? candidates : stations;
+    const scored = [...pool].sort((a, b) => {
+      const aLive = liveKeys.has(stationKey(a)) ? 0 : 1;
+      const bLive = liveKeys.has(stationKey(b)) ? 0 : 1;
+      if (aLive !== bLive) return aLive - bLive;
+      return (a.bitrate || 999) - (b.bitrate || 999);
+    });
+    // Don't always take #1 — rotate among the top 3 so one country
+    // switch doesn't always land on the same station.
+    const top = scored.slice(0, 3);
+    return top[Math.floor(Math.random() * top.length)];
   }
 
   function step(dir) {
@@ -509,14 +615,16 @@ export default function App() {
 
       <audio
         ref={audioRef}
-        preload="none"
+        preload="metadata"
         onPlaying={() => {
+          clearTimeout(playTimeoutRef.current);
           setPlaying(true);
           setBuffering(false);
         }}
         onPause={() => setPlaying(false)}
         onWaiting={() => setBuffering(true)}
         onError={() => {
+          clearTimeout(playTimeoutRef.current);
           setBuffering(false);
           setPlaying(false);
           if (current) setError(`Couldn't play “${current.name}”. Try another station.`);
