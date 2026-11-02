@@ -6,13 +6,53 @@ const SERVERS = [
   'https://nl1.api.radio-browser.info',
 ];
 
+// Pick the fastest directory mirror once per session (race them) and
+// reuse it — avoids paying handshake latency on the slow mirrors for
+// every single query.
+let fastServer = null;
+let serverRace = null;
+
+function pickServer() {
+  if (fastServer) return Promise.resolve(fastServer);
+  if (!serverRace) {
+    serverRace = Promise.allSettled(
+      SERVERS.map(async (base) => {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 5000);
+        const t0 = performance.now();
+        try {
+          const res = await fetch(`${base}/json/stats?`, {
+            headers: { 'User-Agent': 'NaijaLofiRadio/1.0' },
+            signal: ctrl.signal,
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          await res.json();
+          return { base, ms: performance.now() - t0 };
+        } finally {
+          clearTimeout(timer);
+        }
+      }),
+    ).then((results) => {
+      const ok = results
+        .filter((r) => r.status === 'fulfilled')
+        .map((r) => r.value)
+        .sort((a, b) => a.ms - b.ms);
+      fastServer = ok[0]?.base ?? SERVERS[0];
+      return fastServer;
+    });
+  }
+  return serverRace;
+}
+
 async function getJson(path) {
+  const base = await pickServer();
+  const servers = [base, ...SERVERS.filter((s) => s !== base)];
   let lastError;
-  for (const base of SERVERS) {
+  for (const server of servers) {
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 8000);
-      const res = await fetch(`${base}${path}`, {
+      const timer = setTimeout(() => ctrl.abort(), 6000);
+      const res = await fetch(`${server}${path}`, {
         headers: { 'User-Agent': 'NaijaLofiRadio/1.0' },
         signal: ctrl.signal,
       });
@@ -128,37 +168,31 @@ const score = (s) => s.clicks * 10 + s.votes;
 export async function fetchDirectoryStations() {
   // Serve a cached snapshot (24h) instantly in the background while fresh
   // data loads — callers use `getCachedDirectory()` for the instant path.
+  // Fewer, bigger queries = fewer round-trips = faster overall fetch.
   const queries = [
     // Everything Nigerian in the directory (~84)
     '/json/stations/search?country=Nigeria&hidebroken=true&order=clickcount&reverse=true&limit=500',
     // Afrobeats/afropop from anywhere in the world
-    '/json/stations/search?tag=afrobeats&hidebroken=true&order=clickcount&reverse=true&limit=200',
-    '/json/stations/search?tag=afropop&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    // Lofi only — no generic chill/ambient/lounge filler
-    '/json/stations/search?tag=lofi&hidebroken=true&order=clickcount&reverse=true&limit=300',
-    '/json/stations/search?tag=lofi-hip-hop&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    '/json/stations/search?tag=chillhop&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    // Africa country picker: Ghana, Kenya, SA + neighbours
-    '/json/stations/search?country=Ghana&hidebroken=true&order=clickcount&reverse=true&limit=200',
-    '/json/stations/search?country=Kenya&hidebroken=true&order=clickcount&reverse=true&limit=150',
-    '/json/stations/search?country=South Africa&hidebroken=true&order=clickcount&reverse=true&limit=150',
-    '/json/stations/search?country=Cameroon&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    '/json/stations/search?country=Tanzania&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    '/json/stations/search?country=Uganda&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    '/json/stations/search?country=Ethiopia&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    '/json/stations/search?country=Senegal&hidebroken=true&order=clickcount&reverse=true&limit=100',
-    // World country picker: Germany, France, UK, USA
-    '/json/stations/search?country=Germany&hidebroken=true&order=clickcount&reverse=true&limit=150',
-    '/json/stations/search?country=France&hidebroken=true&order=clickcount&reverse=true&limit=150',
-    '/json/stations/search?country=United Kingdom&hidebroken=true&order=clickcount&reverse=true&limit=150',
-    '/json/stations/search?country=United States&hidebroken=true&order=clickcount&reverse=true&limit=200',
+    '/json/stations/search?tag=afrobeats&hidebroken=true&order=clickcount&reverse=true&limit=300',
+    // Lofi only — one big pull instead of three small ones
+    '/json/stations/search?tag=lofi&hidebroken=true&order=clickcount&reverse=true&limit=500',
+    // Africa country picker: Ghana, Kenya, South Africa
+    '/json/stations/search?country=Ghana&hidebroken=true&order=clickcount&reverse=true&limit=250',
+    '/json/stations/search?country=Kenya&hidebroken=true&order=clickcount&reverse=true&limit=200',
+    '/json/stations/search?country=South Africa&hidebroken=true&order=clickcount&reverse=true&limit=200',
+    // World: Germany, France, UK, USA
+    '/json/stations/search?country=Germany&hidebroken=true&order=clickcount&reverse=true&limit=200',
+    '/json/stations/search?country=France&hidebroken=true&order=clickcount&reverse=true&limit=200',
+    '/json/stations/search?country=United Kingdom&hidebroken=true&order=clickcount&reverse=true&limit=200',
+    '/json/stations/search?country=United States&hidebroken=true&order=clickcount&reverse=true&limit=250',
   ];
-  // Cap the whole fan-out: slow queries resolve to [] instead of holding
-  // up the merge. Fast servers still contribute their results.
+  // Cap the whole fan-out: the fastest mirror is pre-picked, so give
+  // each query 6s — slow ones resolve to [] instead of holding up the
+  // merge. Fast queries still contribute their results.
   const withTimeout = (q) =>
     Promise.race([
       getJson(q).catch(() => []),
-      new Promise((resolve) => setTimeout(() => resolve([]), 9000)),
+      new Promise((resolve) => setTimeout(() => resolve([]), 6000)),
     ]);
   const batches = await Promise.all(queries.map(withTimeout));
   const seen = new Set();

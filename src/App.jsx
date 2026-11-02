@@ -141,8 +141,24 @@ export default function App() {
   const audioRef = useRef(null);
   const debounceRef = useRef(null);
   const playTimeoutRef = useRef(null);
+  const preloadRef = useRef(null);
+  const bufferTickRef = useRef(null);
   const titleRef = useRef(null);
   const [titleLong, setTitleLong] = useState(false);
+  const [bufferSecs, setBufferSecs] = useState(0);
+
+  // Count seconds while buffering so the wait feels honest, and offer
+  // a faster station after a few seconds instead of a dead spinner.
+  useEffect(() => {
+    if (buffering) {
+      setBufferSecs(0);
+      clearInterval(bufferTickRef.current);
+      bufferTickRef.current = setInterval(() => setBufferSecs((s) => s + 1), 1000);
+    } else {
+      clearInterval(bufferTickRef.current);
+    }
+    return () => clearInterval(bufferTickRef.current);
+  }, [buffering, current]);
 
   // Flag long station names so the player title flows (marquee)
   // instead of stretching the card. Short names sit still.
@@ -258,17 +274,20 @@ export default function App() {
   );
   // Radio mode narrows by country (Nigeria, Ghana, Germany, USA, …).
   // Sorted by station count so the busiest countries come first.
+  // The country filter applies to search results too — picking USA then
+  // searching only shows USA stations, never the whole world.
   const countries = useMemo(() => {
     if (mode !== 'radio') return [];
+    const base = searchingActive ? directory.filter((s) => s.category === mode) : modePool;
     const counts = new Map();
-    for (const s of modePool) {
+    for (const s of base) {
       const c = shortCountry(s.country) || 'Other';
       counts.set(c, (counts.get(c) ?? 0) + 1);
     }
     return [...counts.entries()]
       .sort((a, b) => b[1] - a[1])
       .map(([name, count]) => ({ name, count }));
-  }, [mode, modePool]);
+  }, [mode, modePool, searchingActive, directory]);
   const countryValid = country === 'all' || countries.some((c) => c.name === country);
   const pool = useMemo(
     () =>
@@ -422,8 +441,21 @@ export default function App() {
     setError('');
     setCurrent(station);
     setBuffering(true);
-    // Warm up the connection (DNS + TLS) before play() so audio
-    // starts faster, then give up + auto-skip if the host stalls.
+    // If a hidden preloader already fetched this station's first bytes,
+    // swap them in — playback starts near-instantly. Otherwise warm up
+    // the connection (DNS + TLS) before play() so audio starts faster.
+    const pre = preloadRef.current;
+    const preUsable =
+      pre && !pre.paused && pre.src === station.url_resolved && pre.readyState >= 2;
+    if (!preUsable && pre) {
+      try {
+        pre.pause();
+        pre.removeAttribute('src');
+        pre.load();
+      } catch {
+        /* noop */
+      }
+    }
     try {
       const host = new URL(station.url_resolved).origin;
       const link = document.createElement('link');
@@ -442,27 +474,71 @@ export default function App() {
     playTimeoutRef.current = setTimeout(() => {
       // Still buffering → this host is slow, skip to the fastest-starting
       // alternative instead of just the next row.
-      setBuffering((b) => {
-        if (b) {
-          audio.pause();
-          const next = pickFastStart(list, station);
-          if (next && stationKey(next) !== stationKey(station)) play(next);
-          else {
-            setBuffering(false);
-            setError(`“${station.name}” is taking too long. Try another station.`);
-          }
-        }
-        return b;
-      });
+      audio.pause();
+      const next = pickFastStart(list, station);
+      if (next && stationKey(next) !== stationKey(station)) {
+        play(next);
+      } else {
+        setBuffering(false);
+        setError(`“${station.name}” is taking too long. Try another station.`);
+      }
     }, skipTimeout);
-    audio.src = station.url_resolved;
-    audio.load();
-    audio.play().then(
+    try {
+      audio.src = station.url_resolved;
+      audio.load();
+    } catch {
+      clearTimeout(playTimeoutRef.current);
+      setBuffering(false);
+      setError(`Couldn't play “${station.name}”. Try another station.`);
+      return;
+    }
+    let playPromise = null;
+    try {
+      playPromise = audio.play();
+    } catch {
+      playPromise = null;
+    }
+    if (!playPromise || typeof playPromise.then !== 'function') {
+      // play() threw or returned nothing (interrupted by a rapid tap) —
+      // retry once on the next tick instead of dying silently.
+      setTimeout(() => {
+        try {
+          const retry = audio.play();
+          if (retry && typeof retry.then === 'function') {
+            retry.then(
+              () => {
+                if (markResumed) setAwaitingResume(false);
+                saveLast({ station, mode, wasPlaying: true });
+              },
+              () => {
+                clearTimeout(playTimeoutRef.current);
+                setBuffering(false);
+                setPlaying(false);
+                if (silentOnAutoplayBlock) {
+                  setAwaitingResume(true);
+                } else {
+                  setError(`Couldn't play “${station.name}”. Try another station.`);
+                }
+              },
+            );
+          }
+        } catch {
+          clearTimeout(playTimeoutRef.current);
+          setBuffering(false);
+          setPlaying(false);
+          setError(`Couldn't play “${station.name}”. Try another station.`);
+        }
+      }, 300);
+      registerClick(station.stationuuid);
+      return;
+    }
+    playPromise.then(
       () => {
         if (markResumed) setAwaitingResume(false);
         saveLast({ station, mode, wasPlaying: true });
       },
       () => {
+        clearTimeout(playTimeoutRef.current);
         setBuffering(false);
         setPlaying(false);
         if (silentOnAutoplayBlock) {
@@ -483,7 +559,15 @@ export default function App() {
       saveLast({ wasPlaying: false });
     } else if (current && stationKey(current) === stationKey(station) && !playing) {
       if (awaitingResume) setAwaitingResume(false);
-      audioRef.current?.play().then(
+      const audio = audioRef.current;
+      // Initial state (or after refresh) has no src loaded on the <audio>
+      // element yet — resuming via .play() alone plays silence. Load the
+      // station properly instead.
+      if (!audio || !audio.src || audio.src !== station.url_resolved) {
+        play(station);
+        return;
+      }
+      audio.play().then(
         () => saveLast({ station, mode, wasPlaying: true }),
         () => {},
       );
@@ -542,6 +626,44 @@ export default function App() {
     const top = scored.slice(0, 3);
     return top[Math.floor(Math.random() * top.length)];
   }
+
+  // Hidden second audio element: pre-fetches the next likely station's
+  // first bytes while you listen, so tapping next/skip (or the auto
+  // skip firing) swaps in audio that's already buffered.
+  function primeNext(excludeKey) {
+    const pre = preloadRef.current;
+    if (!pre || list.length < 2) return;
+    const next = pickFastStart(list, { stationuuid: excludeKey, url_resolved: excludeKey });
+    if (!next || stationKey(next) === excludeKey) return;
+    if (pre.src === next.url_resolved && !pre.paused) return;
+    try {
+      pre.src = next.url_resolved;
+      pre.load();
+      pre.play().then(
+        () => {
+          // Mute + pause as soon as data flows — we only wanted the
+          // connection warm and the first chunk buffered.
+          setTimeout(() => {
+            try {
+              if (preloadRef.current === pre && pre.src === next.url_resolved) pre.pause();
+            } catch {
+              /* noop */
+            }
+          }, 4000);
+        },
+        () => {},
+      );
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  useEffect(() => {
+    if (!playing || !current) return undefined;
+    const timer = setTimeout(() => primeNext(stationKey(current)), 3000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing, current && stationKey(current), poolSig]);
 
   function step(dir) {
     if (list.length === 0) return;
@@ -630,6 +752,9 @@ export default function App() {
           if (current) setError(`Couldn't play “${current.name}”. Try another station.`);
         }}
       />
+      {/* Hidden preloader: warms the next station's connection + buffers
+          its first chunk so skips start near-instantly. Muted always. */}
+      <audio ref={preloadRef} preload="none" muted aria-hidden tabIndex={-1} />
 
       <header className="top">
         <p className="logo">☕ naija · lofi radio</p>
@@ -715,12 +840,23 @@ export default function App() {
                   shortCountry(current.country),
                   current.language,
                   current.bitrate ? `${current.bitrate}kbps` : '',
-                  buffering ? 'buffering…' : playing ? 'now playing' : 'paused',
+                  buffering ? `buffering… ${bufferSecs}s` : playing ? 'now playing' : 'paused',
                 ]
                   .filter(Boolean)
                   .join(' · ')
               : '—'}
           </p>
+          {buffering && bufferSecs >= 4 && current && (
+            <button
+              className="skip-slow"
+              onClick={() => {
+                const next = pickFastStart(list, current);
+                if (next) play(next);
+              }}
+            >
+              ⏩ taking too long? play something faster
+            </button>
+          )}
 
           <div className="transport">
             <button className="skip" onClick={() => step(-1)} title="Previous station">
@@ -756,7 +892,7 @@ export default function App() {
           </label>
         </section>
 
-        <section className="stations">
+        <section className={searchingActive ? 'stations searching' : 'stations'}>
           <div className="stations-head">
             <h2>
               {searchingActive
@@ -784,18 +920,26 @@ export default function App() {
               >
                 ♥
               </button>
-              <input
-                className="mini-search"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="search 400+ stations…"
-              />
-              {searchingActive && (
-                <button className="chip" onClick={() => setQuery('')}>
-                  ✕
-                </button>
-              )}
             </div>
+          </div>
+          <div className="search-row">
+            <input
+              className="mini-search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={
+                mode === 'radio' && country !== 'all'
+                  ? `search ${country} stations…`
+                  : mode === 'radio'
+                    ? 'search all radio stations…'
+                    : 'search lofi stations…'
+              }
+            />
+            {searchingActive && (
+              <button className="chip" onClick={() => setQuery('')}>
+                ✕
+              </button>
+            )}
           </div>
 
           {searching ? (
