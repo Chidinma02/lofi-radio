@@ -876,6 +876,26 @@ body::before {
   animation: none;
 }
 
+.fm-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  background: var(--pop);
+  color: var(--ink);
+  border: 1.5px solid var(--ink);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.row.current .fm-badge {
+  background: var(--ink);
+  color: var(--pop);
+}
+
 .row {
   display: flex;
   align-items: center;

@@ -38,6 +38,21 @@ function stationKey(s) {
   return s.stationuuid || s.url_resolved;
 }
 
+// Pull "96.9" style frequencies out of names ("Cool FM 96.9 Lagos")
+// so rows show a tidy FM badge instead of a cluttered name.
+function fmInfo(name) {
+  const raw = name || '';
+  const m = raw.match(/(\d{2,3}(?:\.\d)?)\s*FM\b/i) || raw.match(/\b(\d{2,3}\.\d)\b/);
+  if (!m) return { freq: null, display: raw };
+  const freq = `${m[1]} FM`;
+  const display = raw
+    .replace(m[0], '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+-\s*$/, '')
+    .trim();
+  return { freq, display: display || raw };
+}
+
 // Old installs saved per-country modes (nigeria, africa, world, …);
 // those are all Radio now.
 function migrateMode(id) {
@@ -699,6 +714,7 @@ export default function App() {
     const isCurrent = current && stationKey(current) === key;
     const isFav = favoriteSet.has(key);
     const isLive = liveKeys.has(key);
+    const { freq, display } = fmInfo(s.name);
     return (
       <li key={key} className={isCurrent ? 'row current' : 'row'}>
         <button className="row-main" onClick={() => toggle(s)}>
@@ -708,7 +724,8 @@ export default function App() {
           </span>
           <span className="row-text">
             <strong>
-              {s.name}
+              {display}
+              {freq && <span className="fm-badge">{freq}</span>}
               {isLive && <span className="live-dot" title="Verified live" />}
             </strong>
             <small>
